@@ -168,7 +168,7 @@ if __name__ == "__main__":
     from ik.data.dataset import IKDataset
     from ik.model.mlp import MLP
 
-    SAVE_DIR = "/content/drive/MyDrive/inverse_kinematics"
+    SAVE_DIR = "G:/My Drive/inverse_kinematics"
     DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"using device: {DEVICE}")
 

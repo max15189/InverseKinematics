@@ -179,7 +179,7 @@ def load_split(save_dir: str, split: str) -> tuple[np.ndarray, np.ndarray, np.nd
 if __name__ == "__main__":
     import os
 
-    SAVE_DIR = "/content/drive/MyDrive/inverse_kinematics"
+    SAVE_DIR = "G:/My Drive/inverse_kinematics"
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     np.random.seed(42)

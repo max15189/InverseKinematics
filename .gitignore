@@ -1,1 +1,4 @@
 .claude/
+venv/
+*.npy
+__pycache__/
