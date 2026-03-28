@@ -7,13 +7,14 @@ import torch.nn as nn
 
 class MLP(nn.Module):
     """
-    Fully-connected network that predicts joint deltas dq given the
-    current joint config q1 and the target end-effector position x_d.
+    Fully-connected network for IK prediction.
 
     Args:
-        input_dim:  size of the normalised input (default 9 = 6 + 3)
+        input_dim:  size of the normalised input
+                      local-Jacobian mode: 9  (q1 [6] + xd [3])
+                      hot-start mode:      3  (xd [3] only)
         hidden_dim: width of each hidden layer
-        output_dim: size of the output (default 6 joint deltas)
+        output_dim: size of the output (default 6 joint angles / deltas)
         n_layers:   number of hidden layers
     """
 
@@ -26,10 +27,10 @@ class MLP(nn.Module):
     ):
         super().__init__()
         layers = []
-        in_dim = input_dim
+        dim = input_dim
         for _ in range(n_layers):
-            layers += [nn.Linear(in_dim, hidden_dim), nn.LeakyReLU()]
-            in_dim = hidden_dim
+            layers += [nn.Linear(dim, hidden_dim), nn.LeakyReLU()]
+            dim = hidden_dim
         layers.append(nn.Linear(hidden_dim, output_dim))
         self.net = nn.Sequential(*layers)
 

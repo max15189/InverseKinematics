@@ -1,5 +1,6 @@
 """
-PyTorch Dataset for the IK local-Jacobian dataset.
+PyTorch Dataset for the IK dataset.
+Supports both local-Jacobian mode (q1, xd → dq) and hot-start mode (xd → q).
 """
 
 import numpy as np
@@ -11,32 +12,33 @@ from ik.data.pipeline import load_split
 
 class IKDataset(Dataset):
     """
-    Dataset of (q1, x_d, dq) tuples for local inverse-kinematics learning.
-
-    Input  X: concatenation of q1 (6) and x_d (3), z-score normalised → (9,)
-    Target Y: dq (6), z-score normalised → (6,)
-
-    Raw q1 and xd tensors are also stored for use in task-space loss
-    computation during training.
-
     Args:
-        split:     one of 'train', 'val', 'test'
-        save_dir:  directory where the split .npy files live
-        scaler_X:  [mean, std] tensors for X; computed from data if None
-        scaler_Y:  [mean, std] tensors for Y; computed from data if None
+        split:      one of 'train', 'val', 'test'
+        save_dir:   directory where the split .npy files live
+        hot_start:  if True, input=xd (3,), target=q (6,) — no dq
+                    if False, input=[q1, xd] (9,), target=dq (6,)
+        scaler_X:   [mean, std] tensors for X; computed from data if None
+        scaler_Y:   [mean, std] tensors for Y; computed from data if None
     """
 
     def __init__(
         self,
         split: str,
         save_dir: str,
+        hot_start: bool = False,
         scaler_X: list | None = None,
         scaler_Y: list | None = None,
     ):
-        q1_np, xd_np, dq_np = load_split(save_dir, split)
+        self.hot_start = hot_start
 
-        X_raw = torch.from_numpy(np.concatenate([q1_np, xd_np], axis=1))
-        Y_raw = torch.from_numpy(dq_np)
+        if hot_start:
+            q1_np, xd_np = load_split(save_dir, split, hot_start=True)
+            X_raw = torch.from_numpy(xd_np)          # input  = xd (3,)
+            Y_raw = torch.from_numpy(q1_np)          # target = q  (6,)
+        else:
+            q1_np, xd_np, dq_np = load_split(save_dir, split, hot_start=False)
+            X_raw = torch.from_numpy(np.concatenate([q1_np, xd_np], axis=1))
+            Y_raw = torch.from_numpy(dq_np)
 
         if scaler_X is None:
             self.scaler_X = [X_raw.mean(dim=0), X_raw.std(dim=0)]

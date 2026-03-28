@@ -160,6 +160,19 @@ def FK_batch(q: torch.Tensor) -> torch.Tensor:
     Returns:
         end-effector positions: (B, 3)
     """
+    return FK_batch_full(q)[:, :3, 3]
+
+
+def FK_batch_full(q: torch.Tensor) -> torch.Tensor:
+    """
+    Batched differentiable forward kinematics returning the full transform.
+
+    Args:
+        q: (B, 6) joint angles in radians.
+
+    Returns:
+        homogeneous transforms: (B, 4, 4)
+    """
     B   = q.shape[0]
     dev = q.device
     Sl  = _Slist_torch.to(dev)
@@ -169,4 +182,4 @@ def FK_batch(q: torch.Tensor) -> torch.Tensor:
     for i in range(5, -1, -1):
         T = _se3_to_SE3_batch(Sl[:, i], q[:, i]) @ T
 
-    return T[:, :3, 3]   # (B, 3)
+    return T   # (B, 4, 4)
