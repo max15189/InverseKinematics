@@ -23,6 +23,7 @@ class IKDataset(Dataset):
 
     def __init__(
         self,
+
         split: str,
         save_dir: str,
         hot_start: bool = False,
@@ -34,7 +35,11 @@ class IKDataset(Dataset):
         if hot_start:
             q1_np, xd_np = load_split(save_dir, split, hot_start=True)
             X_raw = torch.from_numpy(xd_np)          # input  = xd (3,)
+            from ik.kinematics.fk import FK_batch_full
+            
             Y_raw = torch.from_numpy(q1_np)          # target = q  (6,)
+            angular_Raw = FK_batch_full(Y_raw)[:, :2, 0:3].reshape(len(Y_raw), -1)  # (B, 6)
+            X_raw = torch.cat([X_raw, angular_Raw], dim=1)                          # (B, 9)
         else:
             q1_np, xd_np, dq_np = load_split(save_dir, split, hot_start=False)
             X_raw = torch.from_numpy(np.concatenate([q1_np, xd_np], axis=1))
