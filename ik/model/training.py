@@ -42,12 +42,12 @@ def task_space_loss(
     if hot_start:
         T_pred   = FK_batch_full(q_pred)
         T_target = FK_batch_full(q_target)
-        pos_loss = torch.norm(T_pred[:, :3, 3] - T_target[:, :3, 3], dim=1)
-        rot_loss = torch.norm(T_pred[:, :3, :3] - T_target[:, :3, :3], dim=(1, 2))
-        return torch.mean(pos_loss + lambda_rot * rot_loss)
+        pos_loss = torch.mean(torch.norm(T_pred[:, :3, 3] - T_target[:, :3, 3], dim=1))
+        rot_loss = torch.mean(torch.norm(T_pred[:, :3, :3] - T_target[:, :3, :3], dim=(1, 2)))
+        return pos_loss + lambda_rot * rot_loss, pos_loss, rot_loss
     else:
-        x_reached = FK_batch(q_pred)
-        return torch.mean(torch.norm(x_reached - xd, dim=1))
+        pos_loss = torch.mean(torch.norm(FK_batch(q_pred) - xd, dim=1))
+        return pos_loss, pos_loss, torch.zeros(1, device=q_pred.device)
 
 
 # ---------------------------------------------------------------------------
@@ -63,10 +63,10 @@ def train(
     hot_start: bool = False,
     lambda_rot: float = 1.0,
 ) -> float:
-    """Run one training epoch. Returns mean loss over the epoch."""
+    """Run one training epoch. Returns (total, pos, rot) mean losses."""
     model.train()
     Y_mean, Y_std = scaler_Y[0].to(device), scaler_Y[1].to(device)
-    total_loss = 0.0
+    total_loss, pos_loss_sum, rot_loss_sum = 0.0, 0.0, 0.0
 
     for X, _, q1, xd in loader:
         X, q1, xd = X.to(device), q1.to(device), xd.to(device)
@@ -76,12 +76,16 @@ def train(
         if not hot_start:
             q_pred = q1 + q_pred   # local-Jacobian: output is delta
 
-        loss = task_space_loss(q_pred, q1, xd, hot_start, lambda_rot)
+        loss, pos, rot = task_space_loss(q_pred, q1, xd, hot_start, lambda_rot)
         loss.backward()
         optimizer.step()
-        total_loss += loss.item() * len(X)
+        n = len(X)
+        total_loss   += loss.item() * n
+        pos_loss_sum += pos.item()  * n
+        rot_loss_sum += rot.item()  * n
 
-    return total_loss / len(loader.dataset)
+    N = len(loader.dataset)
+    return total_loss / N, pos_loss_sum / N, rot_loss_sum / N
 
 
 def evaluate(
@@ -92,10 +96,10 @@ def evaluate(
     hot_start: bool = False,
     lambda_rot: float = 1.0,
 ) -> float:
-    """Evaluate on a loader without gradients. Returns mean loss."""
+    """Evaluate on a loader without gradients. Returns (total, pos, rot) mean losses."""
     model.eval()
     Y_mean, Y_std = scaler_Y[0].to(device), scaler_Y[1].to(device)
-    total_loss = 0.0
+    total_loss, pos_loss_sum, rot_loss_sum = 0.0, 0.0, 0.0
 
     with torch.no_grad():
         for X, _, q1, xd in loader:
@@ -105,10 +109,14 @@ def evaluate(
             if not hot_start:
                 q_pred = q1 + q_pred
 
-            loss = task_space_loss(q_pred, q1, xd, hot_start, lambda_rot)
-            total_loss += loss.item() * len(X)
+            loss, pos, rot = task_space_loss(q_pred, q1, xd, hot_start, lambda_rot)
+            n = len(X)
+            total_loss   += loss.item() * n
+            pos_loss_sum += pos.item()  * n
+            rot_loss_sum += rot.item()  * n
 
-    return total_loss / len(loader.dataset)
+    N = len(loader.dataset)
+    return total_loss / N, pos_loss_sum / N, rot_loss_sum / N
 
 
 def evaluate_and_return_loss(
@@ -118,11 +126,12 @@ def evaluate_and_return_loss(
     scaler_Y: list,
     hot_start: bool = False,
     lambda_rot: float = 1.0,
-) -> torch.Tensor:
-    """Return per-sample losses as a 1-D tensor. Useful for error analysis."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return per-sample (pos_losses, rot_losses, total_losses) as 1-D tensors.
+    rot_losses is zeros when hot_start=False. Prints mean of all three."""
     model.eval()
     Y_mean, Y_std = scaler_Y[0].to(device), scaler_Y[1].to(device)
-    all_losses = []
+    all_pos, all_rot, all_total = [], [], []
 
     with torch.no_grad():
         for X, _, q1, xd in loader:
@@ -137,11 +146,27 @@ def evaluate_and_return_loss(
                 T_target = FK_batch_full(q1)
                 pos_loss = torch.norm(T_pred[:, :3, 3] - T_target[:, :3, 3], dim=1)
                 rot_loss = torch.norm(T_pred[:, :3, :3] - T_target[:, :3, :3], dim=(1, 2))
-                all_losses.append(pos_loss + lambda_rot * rot_loss)
+                total    = pos_loss + lambda_rot * rot_loss
             else:
-                all_losses.append(torch.norm(FK_batch(q_pred) - xd, dim=1))
+                pos_loss = torch.norm(FK_batch(q_pred) - xd, dim=1)
+                rot_loss = torch.zeros_like(pos_loss)
+                total    = pos_loss
 
-    return torch.cat(all_losses)
+            all_pos.append(pos_loss)
+            all_rot.append(rot_loss)
+            all_total.append(total)
+
+    pos_losses   = torch.cat(all_pos)
+    rot_losses   = torch.cat(all_rot)
+    total_losses = torch.cat(all_total)
+
+    print(
+        f"mean pos loss:   {pos_losses.mean().item():.4f} | "
+        f"mean rot loss:   {rot_losses.mean().item():.4f} | "
+        f"mean total loss: {total_losses.mean().item():.4f}"
+    )
+
+    return pos_losses, rot_losses, total_losses
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +201,8 @@ def run_training(
     no_improvement = 0
 
     for epoch in range(1, epochs + 1):
-        train_loss = train(model, train_loader, optimizer, device, scaler_Y, hot_start, lambda_rot)
-        val_loss   = evaluate(model, val_loader, device, scaler_Y, hot_start, lambda_rot)
+        train_loss, train_pos, train_rot = train(model, train_loader, optimizer, device, scaler_Y, hot_start, lambda_rot)
+        val_loss,   val_pos,   val_rot   = evaluate(model, val_loader, device, scaler_Y, hot_start, lambda_rot)
         scheduler.step(val_loss)
 
         if val_loss < best_val:
@@ -189,9 +214,9 @@ def run_training(
 
         print(
             f"epoch {epoch:3d} | "
-            f"train: {train_loss:.4f} | "
-            f"val: {val_loss:.4f} | "
-            f"lr: {optimizer.param_groups[0]['lr']:.2e}"
+            f"train {train_loss:.4f} (pos {train_pos:.4f} rot {train_rot:.4f}) | "
+            f"val {val_loss:.4f} (pos {val_pos:.4f} rot {val_rot:.4f}) | "
+            f"lr {optimizer.param_groups[0]['lr']:.2e}"
         )
 
         if no_improvement >= patience:
