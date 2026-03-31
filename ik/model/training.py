@@ -1,53 +1,42 @@
 """
 Training and evaluation routines for the IK MLP.
 
-Two modes controlled by hot_start flag:
-
-  hot_start=False (local-Jacobian):
-    q_pred = q1 + dq_pred
-    loss   = ||FK(q_pred)[:3,3] - xd||
-
-  hot_start=True:
-    q_pred = model output (absolute q)
-    loss   = ||p_pred - p_target|| + lambda_rot * ||R_pred - R_target||_F
-    where R_target comes from FK(q1) — q1 IS the target config in this mode.
+Loss:
+  Primary:  MSE of predicted q (normalised) vs ground-truth y — backpropagated.
+  Display:  Position error  ||FK(q_pred)[:3,3] - P_target||
+            Rotation error  ||R_pred_6          - R6_target||  (first 2 rows, 6-D)
+  Display losses are computed with no_grad and are NOT backpropagated.
 """
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from ik.kinematics.fk import FK_batch, FK_batch_full
+from ik.kinematics.fk import FK_batch_full
 
 
 # ---------------------------------------------------------------------------
-# Loss
+# Helpers
 # ---------------------------------------------------------------------------
 
-def task_space_loss(
-    q_pred: torch.Tensor,
-    q_target: torch.Tensor,
-    xd: torch.Tensor,
-    hot_start: bool = False,
-    lambda_rot: float = 1.0,
-) -> torch.Tensor:
-    """
-    Args:
-        q_pred:    (B, 6) predicted joint config
-        q_target:  (B, 6) target joint config (q1 in the dataset)
-        xd:        (B, 3) target EE position
-        hot_start: if True adds Frobenius rotation loss
-        lambda_rot: weight for rotation term (only used when hot_start=True)
-    """
-    if hot_start:
-        T_pred   = FK_batch_full(q_pred)
-        T_target = FK_batch_full(q_target)
-        pos_loss = torch.mean(torch.norm(T_pred[:, :3, 3] - T_target[:, :3, 3], dim=1))
-        rot_loss = torch.mean(torch.norm(T_pred[:, :3, :3] - T_target[:, :3, :3], dim=(1, 2)))
-        return pos_loss + lambda_rot * rot_loss, pos_loss, rot_loss
-    else:
-        pos_loss = torch.mean(torch.norm(FK_batch(q_pred) - xd, dim=1))
-        return pos_loss, pos_loss, torch.zeros(1, device=q_pred.device)
+def _to_tensors(MinMax_Y: list, device):
+    Y_min = torch.as_tensor(MinMax_Y[0], dtype=torch.float32).to(device)
+    Y_max = torch.as_tensor(MinMax_Y[1], dtype=torch.float32).to(device)
+    return Y_min, Y_max
+
+
+def _denorm_q(y_pred: torch.Tensor, Y_min: torch.Tensor, Y_max: torch.Tensor) -> torch.Tensor:
+    """Inverse of MinMax [-1, 1] normalisation."""
+    return (y_pred + 1) / 2 * (Y_max - Y_min) + Y_min
+
+
+def _display_losses(q_pred_raw, P_target, R6_target):
+    """FK on predicted q only; compare against raw targets directly."""
+    T_pred   = FK_batch_full(q_pred_raw)
+    pos_disp = torch.mean(torch.norm(T_pred[:, :3, 3] - P_target, dim=1))
+    R_pred_6 = T_pred[:, :2, :3].reshape(len(q_pred_raw), 6)
+    rot_disp = torch.mean(torch.norm(R_pred_6 - R6_target, dim=1))
+    return pos_disp, rot_disp
 
 
 # ---------------------------------------------------------------------------
@@ -59,114 +48,110 @@ def train(
     loader: DataLoader,
     optimizer,
     device,
-    scaler_Y: list,
-    hot_start: bool = False,
-    lambda_rot: float = 1.0,
-) -> float:
-    """Run one training epoch. Returns (total, pos, rot) mean losses."""
+    MinMax_Y: list,
+) -> tuple:
+    """Run one training epoch. Returns (mse_loss, pos_display, rot_display)."""
     model.train()
-    Y_mean, Y_std = scaler_Y[0].to(device), scaler_Y[1].to(device)
-    total_loss, pos_loss_sum, rot_loss_sum = 0.0, 0.0, 0.0
+    Y_min, Y_max = _to_tensors(MinMax_Y, device)
+    criterion = nn.MSELoss()
+    total_mse, pos_sum, rot_sum = 0.0, 0.0, 0.0
 
-    for X, _, q1, xd in loader:
-        X, q1, xd = X.to(device), q1.to(device), xd.to(device)
+    for X, y, _, _, P_target, R6_target in loader:
+        X, y      = X.to(device), y.to(device)
+        P_target  = P_target.to(device)
+        R6_target = R6_target.to(device)
+
         optimizer.zero_grad()
-
-        q_pred = model(X) * Y_std + Y_mean
-        if not hot_start:
-            q_pred = q1 + q_pred   # local-Jacobian: output is delta
-
-        loss, pos, rot = task_space_loss(q_pred, q1, xd, hot_start, lambda_rot)
+        y_pred = model(X)
+        loss   = criterion(y_pred, y)
         loss.backward()
         optimizer.step()
+
+        with torch.no_grad():
+            q_pred_raw         = _denorm_q(y_pred.detach(), Y_min, Y_max)
+            pos_disp, rot_disp = _display_losses(q_pred_raw, P_target, R6_target)
+
         n = len(X)
-        total_loss   += loss.item() * n
-        pos_loss_sum += pos.item()  * n
-        rot_loss_sum += rot.item()  * n
+        total_mse += loss.item() * n
+        pos_sum   += pos_disp.item() * n
+        rot_sum   += rot_disp.item() * n
 
     N = len(loader.dataset)
-    return total_loss / N, pos_loss_sum / N, rot_loss_sum / N
+    return total_mse / N, pos_sum / N, rot_sum / N
 
 
 def evaluate(
     model: nn.Module,
     loader: DataLoader,
     device,
-    scaler_Y: list,
-    hot_start: bool = False,
-    lambda_rot: float = 1.0,
-) -> float:
-    """Evaluate on a loader without gradients. Returns (total, pos, rot) mean losses."""
+    MinMax_Y: list,
+) -> tuple:
+    """Evaluate on a loader without gradients. Returns (mse_loss, pos_display, rot_display)."""
     model.eval()
-    Y_mean, Y_std = scaler_Y[0].to(device), scaler_Y[1].to(device)
-    total_loss, pos_loss_sum, rot_loss_sum = 0.0, 0.0, 0.0
+    Y_min, Y_max = _to_tensors(MinMax_Y, device)
+    criterion = nn.MSELoss()
+    total_mse, pos_sum, rot_sum = 0.0, 0.0, 0.0
 
     with torch.no_grad():
-        for X, _, q1, xd in loader:
-            X, q1, xd = X.to(device), q1.to(device), xd.to(device)
+        for X, y, _, _, P_target, R6_target in loader:
+            X, y      = X.to(device), y.to(device)
+            P_target  = P_target.to(device)
+            R6_target = R6_target.to(device)
 
-            q_pred = model(X) * Y_std + Y_mean
-            if not hot_start:
-                q_pred = q1 + q_pred
+            y_pred             = model(X)
+            loss               = criterion(y_pred, y)
+            q_pred_raw         = _denorm_q(y_pred, Y_min, Y_max)
+            pos_disp, rot_disp = _display_losses(q_pred_raw, P_target, R6_target)
 
-            loss, pos, rot = task_space_loss(q_pred, q1, xd, hot_start, lambda_rot)
             n = len(X)
-            total_loss   += loss.item() * n
-            pos_loss_sum += pos.item()  * n
-            rot_loss_sum += rot.item()  * n
+            total_mse += loss.item() * n
+            pos_sum   += pos_disp.item() * n
+            rot_sum   += rot_disp.item() * n
 
     N = len(loader.dataset)
-    return total_loss / N, pos_loss_sum / N, rot_loss_sum / N
+    return total_mse / N, pos_sum / N, rot_sum / N
 
 
 def evaluate_and_return_loss(
     model: nn.Module,
     loader: DataLoader,
     device,
-    scaler_Y: list,
-    hot_start: bool = False,
-    lambda_rot: float = 1.0,
+    MinMax_Y: list,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return per-sample (pos_losses, rot_losses, total_losses) as 1-D tensors.
-    rot_losses is zeros when hot_start=False. Prints mean of all three."""
+    """Return per-sample (mse_losses, pos_losses, rot_losses) as 1-D tensors. Prints means."""
     model.eval()
-    Y_mean, Y_std = scaler_Y[0].to(device), scaler_Y[1].to(device)
-    all_pos, all_rot, all_total = [], [], []
+    Y_min, Y_max = _to_tensors(MinMax_Y, device)
+    all_mse, all_pos, all_rot = [], [], []
 
     with torch.no_grad():
-        for X, _, q1, xd in loader:
-            X, q1, xd = X.to(device), q1.to(device), xd.to(device)
+        for X, y, _, _, P_target, R6_target in loader:
+            X, y      = X.to(device), y.to(device)
+            P_target  = P_target.to(device)
+            R6_target = R6_target.to(device)
 
-            q_pred = model(X) * Y_std + Y_mean
-            if not hot_start:
-                q_pred = q1 + q_pred
+            y_pred     = model(X)
+            mse        = (y_pred - y).pow(2).mean(dim=1)
+            q_pred_raw = _denorm_q(y_pred, Y_min, Y_max)
 
-            if hot_start:
-                T_pred   = FK_batch_full(q_pred)
-                T_target = FK_batch_full(q1)
-                pos_loss = torch.norm(T_pred[:, :3, 3] - T_target[:, :3, 3], dim=1)
-                rot_loss = torch.norm(T_pred[:, :3, :3] - T_target[:, :3, :3], dim=(1, 2))
-                total    = pos_loss + lambda_rot * rot_loss
-            else:
-                pos_loss = torch.norm(FK_batch(q_pred) - xd, dim=1)
-                rot_loss = torch.zeros_like(pos_loss)
-                total    = pos_loss
+            T_pred   = FK_batch_full(q_pred_raw)
+            pos_loss = torch.norm(T_pred[:, :3, 3] - P_target, dim=1)
+            R_pred_6 = T_pred[:, :2, :3].reshape(len(X), 6)
+            rot_loss = torch.norm(R_pred_6 - R6_target, dim=1)
 
+            all_mse.append(mse)
             all_pos.append(pos_loss)
             all_rot.append(rot_loss)
-            all_total.append(total)
 
-    pos_losses   = torch.cat(all_pos)
-    rot_losses   = torch.cat(all_rot)
-    total_losses = torch.cat(all_total)
+    mse_losses = torch.cat(all_mse)
+    pos_losses = torch.cat(all_pos)
+    rot_losses = torch.cat(all_rot)
 
     print(
-        f"mean pos loss:   {pos_losses.mean().item():.4f} | "
-        f"mean rot loss:   {rot_losses.mean().item():.4f} | "
-        f"mean total loss: {total_losses.mean().item():.4f}"
+        f"mean mse loss: {mse_losses.mean().item():.4f} | "
+        f"mean pos loss: {pos_losses.mean().item():.4f} | "
+        f"mean rot loss: {rot_losses.mean().item():.4f}"
     )
-
-    return pos_losses, rot_losses, total_losses
+    return mse_losses, pos_losses, rot_losses
 
 
 # ---------------------------------------------------------------------------
@@ -177,20 +162,17 @@ def run_training(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    scaler_Y: list,
+    MinMax_Y: list,
     device,
     save_path: str,
     epochs: int = 200,
     lr: float = 1e-3,
     patience: int = 30,
-    hot_start: bool = False,
-    lambda_rot: float = 1.0,
 ) -> nn.Module:
     """
     Full training loop with ReduceLROnPlateau scheduler and early stopping.
-
-    Returns:
-        model with the best weights loaded.
+    Primary loss: MSE on normalised q.
+    Returns model with the best weights loaded.
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -201,12 +183,12 @@ def run_training(
     no_improvement = 0
 
     for epoch in range(1, epochs + 1):
-        train_loss, train_pos, train_rot = train(model, train_loader, optimizer, device, scaler_Y, hot_start, lambda_rot)
-        val_loss,   val_pos,   val_rot   = evaluate(model, val_loader, device, scaler_Y, hot_start, lambda_rot)
-        scheduler.step(val_loss)
+        train_mse, train_pos, train_rot = train(model, train_loader, optimizer, device, MinMax_Y)
+        val_mse,   val_pos,   val_rot   = evaluate(model, val_loader, device, MinMax_Y)
+        scheduler.step(val_mse)
 
-        if val_loss < best_val:
-            best_val = val_loss
+        if val_mse < best_val:
+            best_val       = val_mse
             torch.save(model.state_dict(), save_path)
             no_improvement = 0
         else:
@@ -214,8 +196,8 @@ def run_training(
 
         print(
             f"epoch {epoch:3d} | "
-            f"train {train_loss:.4f} (pos {train_pos:.4f} rot {train_rot:.4f}) | "
-            f"val {val_loss:.4f} (pos {val_pos:.4f} rot {val_rot:.4f}) | "
+            f"train mse {train_mse:.4f} (pos {train_pos:.4f} rot {train_rot:.4f}) | "
+            f"val mse {val_mse:.4f} (pos {val_pos:.4f} rot {val_rot:.4f}) | "
             f"lr {optimizer.param_groups[0]['lr']:.2e}"
         )
 
@@ -223,9 +205,8 @@ def run_training(
             print(f"Early stopping at epoch {epoch}.")
             break
 
-    print(f"\nbest val loss: {best_val:.4f}")
+    print(f"\nbest val mse: {best_val:.4f}")
     print(f"model saved to {save_path}")
-
     model.load_state_dict(torch.load(save_path, map_location=device))
     return model
 
@@ -235,34 +216,28 @@ def run_training(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from torch.utils.data import DataLoader
-
     from ik.data.dataset import IKDataset
     from ik.model.mlp import MLP
 
-    HOT_START = True
-    SAVE_DIR  = "G:/My Drive/inverse_kinematics/hot_start"
-    DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    SAVE_DIR = "G:/My Drive/inverse_kinematics/hot_start"
+    DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"using device: {DEVICE}")
 
-    train_ds = IKDataset("train", SAVE_DIR, hot_start=HOT_START)
-    val_ds   = IKDataset("val",   SAVE_DIR, hot_start=HOT_START,
-                         scaler_X=train_ds.scaler_X, scaler_Y=train_ds.scaler_Y)
+    train_ds = IKDataset("train", SAVE_DIR)
+    val_ds   = IKDataset("val",   SAVE_DIR,
+                         MinMax_X=train_ds.MinMax_X, MinMax_Y=train_ds.MinMax_Y)
 
     train_loader = DataLoader(train_ds, batch_size=512, shuffle=True,  num_workers=2)
     val_loader   = DataLoader(val_ds,   batch_size=512, shuffle=False, num_workers=2)
 
-    input_dim = 3 if HOT_START else 9
-    model = MLP(input_dim=input_dim).to(DEVICE)
+    model = MLP(input_dim=15).to(DEVICE)  # 6 (R6) + 3 (P) + 6 (q_init) = 15
     print(f"model parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"train samples:    {len(train_ds):,}")
     print(f"val samples:      {len(val_ds):,}\n")
 
     run_training(
         model, train_loader, val_loader,
-        scaler_Y=train_ds.scaler_Y,
+        MinMax_Y=train_ds.MinMax_Y,
         device=DEVICE,
-        save_path=f"{SAVE_DIR}/mlp_hot_start.pt",
-        hot_start=HOT_START,
-        lambda_rot=1.0,
+        save_path=f"{SAVE_DIR}/mlp_ik.pt",
     )
