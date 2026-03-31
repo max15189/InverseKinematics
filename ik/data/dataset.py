@@ -20,6 +20,7 @@ class IKDataset(Dataset):
   ):
 
     q_init,q_target,P_target,R6_target=load_split(save_dir,split)
+    R6_target=R6_target.reshape(-1,6)  # (n,2,3) -> (n,6)
 
     y=q_target.copy()
     X=np.concatenate([R6_target,P_target,q_init],axis=1)
