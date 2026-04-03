@@ -20,7 +20,7 @@ class MLP(nn.Module):
 
     def __init__(
         self,
-        input_dim: int  = 9,
+        input_dim: int  = 15,
         hidden_dim: int = 256,
         output_dim: int = 6,
         n_layers: int   = 4,
