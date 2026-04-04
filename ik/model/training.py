@@ -1,11 +1,12 @@
 """
 Training and evaluation routines for the IK MLP.
 
-Loss:
-  Primary:  MSE of predicted q (normalised) vs ground-truth y — backpropagated.
-  Display:  Position error  ||FK(q_pred)[:3,3] - P_target||
-            Rotation error  ||R_pred_6          - R6_target||  (first 2 rows, 6-D)
-  Display losses are computed with no_grad and are NOT backpropagated.
+Loss (combined):
+  MSE(q_pred_norm, q_true_norm)          — joint-space branch consistency
+  + alpha_pos * ||FK(q_pred)[:3,3] - P_target||   — task-space position
+  + alpha_rot * ||R_pred_6 - R6_target||           — task-space rotation
+All three terms are backpropagated. alpha_pos / alpha_rot default to 1.0 / 0.1.
+Setting both to 0 reverts to pure joint-space MSE.
 """
 
 import torch
@@ -30,13 +31,16 @@ def _denorm_q(y_pred: torch.Tensor, Y_min: torch.Tensor, Y_max: torch.Tensor) ->
     return (y_pred + 1) / 2 * (Y_max - Y_min) + Y_min
 
 
-def _display_losses(q_pred_raw, P_target, R6_target):
-    """FK on predicted q only; compare against raw targets directly."""
+def _task_space_losses(q_pred_raw, P_target, R6_target):
+    """
+    Compute batched position and rotation errors from raw (denormalised) q_pred.
+    Differentiable — call inside autograd context for backprop, or with no_grad for display.
+    """
     T_pred   = FK_batch_full(q_pred_raw)
-    pos_disp = torch.mean(torch.norm(T_pred[:, :3, 3] - P_target, dim=1))
+    pos_loss = torch.mean(torch.norm(T_pred[:, :3, 3] - P_target, dim=1))
     R_pred_6 = T_pred[:, :2, :3].reshape(len(q_pred_raw), 6)
-    rot_disp = torch.mean(torch.norm(R_pred_6 - R6_target, dim=1))
-    return pos_disp, rot_disp
+    rot_loss = torch.mean(torch.norm(R_pred_6 - R6_target, dim=1))
+    return pos_loss, rot_loss
 
 
 # ---------------------------------------------------------------------------
@@ -49,12 +53,18 @@ def train(
     optimizer,
     device,
     MinMax_Y: list,
+    alpha_pos: float = 1.0,
+    alpha_rot: float = 0.1,
 ) -> tuple:
-    """Run one training epoch. Returns (mse_loss, pos_display, rot_display)."""
+    """
+    Run one training epoch.
+    Loss = MSE(q_norm) + alpha_pos * pos_err + alpha_rot * rot_err.
+    Returns (total_loss, pos_loss, rot_loss) epoch means.
+    """
     model.train()
     Y_min, Y_max = _to_tensors(MinMax_Y, device)
     criterion = nn.MSELoss()
-    total_mse, pos_sum, rot_sum = 0.0, 0.0, 0.0
+    total_loss, pos_sum, rot_sum = 0.0, 0.0, 0.0
 
     for X, y, _, _, P_target, R6_target in loader:
         X, y      = X.to(device), y.to(device)
@@ -62,22 +72,23 @@ def train(
         R6_target = R6_target.to(device)
 
         optimizer.zero_grad()
-        y_pred = model(X)
-        loss   = criterion(y_pred, y)
+        y_pred     = model(X)
+        mse_loss   = criterion(y_pred, y)
+
+        q_pred_raw          = _denorm_q(y_pred, Y_min, Y_max)
+        pos_loss, rot_loss  = _task_space_losses(q_pred_raw, P_target, R6_target)
+
+        loss = mse_loss + alpha_pos * pos_loss + alpha_rot * rot_loss
         loss.backward()
         optimizer.step()
 
-        with torch.no_grad():
-            q_pred_raw         = _denorm_q(y_pred.detach(), Y_min, Y_max)
-            pos_disp, rot_disp = _display_losses(q_pred_raw, P_target, R6_target)
-
         n = len(X)
-        total_mse += loss.item() * n
-        pos_sum   += pos_disp.item() * n
-        rot_sum   += rot_disp.item() * n
+        total_loss += loss.item() * n
+        pos_sum    += pos_loss.item() * n
+        rot_sum    += rot_loss.item() * n
 
     N = len(loader.dataset)
-    return total_mse / N, pos_sum / N, rot_sum / N
+    return total_loss / N, pos_sum / N, rot_sum / N
 
 
 def evaluate(
@@ -85,12 +96,14 @@ def evaluate(
     loader: DataLoader,
     device,
     MinMax_Y: list,
+    alpha_pos: float = 1.0,
+    alpha_rot: float = 0.1,
 ) -> tuple:
-    """Evaluate on a loader without gradients. Returns (mse_loss, pos_display, rot_display)."""
+    """Evaluate on a loader without gradients. Returns (total_loss, pos_loss, rot_loss)."""
     model.eval()
     Y_min, Y_max = _to_tensors(MinMax_Y, device)
     criterion = nn.MSELoss()
-    total_mse, pos_sum, rot_sum = 0.0, 0.0, 0.0
+    total_loss, pos_sum, rot_sum = 0.0, 0.0, 0.0
 
     with torch.no_grad():
         for X, y, _, _, P_target, R6_target in loader:
@@ -98,18 +111,19 @@ def evaluate(
             P_target  = P_target.to(device)
             R6_target = R6_target.to(device)
 
-            y_pred             = model(X)
-            loss               = criterion(y_pred, y)
-            q_pred_raw         = _denorm_q(y_pred, Y_min, Y_max)
-            pos_disp, rot_disp = _display_losses(q_pred_raw, P_target, R6_target)
+            y_pred              = model(X)
+            mse_loss            = criterion(y_pred, y)
+            q_pred_raw          = _denorm_q(y_pred, Y_min, Y_max)
+            pos_loss, rot_loss  = _task_space_losses(q_pred_raw, P_target, R6_target)
+            loss                = mse_loss + alpha_pos * pos_loss + alpha_rot * rot_loss
 
             n = len(X)
-            total_mse += loss.item() * n
-            pos_sum   += pos_disp.item() * n
-            rot_sum   += rot_disp.item() * n
+            total_loss += loss.item() * n
+            pos_sum    += pos_loss.item() * n
+            rot_sum    += rot_loss.item() * n
 
     N = len(loader.dataset)
-    return total_mse / N, pos_sum / N, rot_sum / N
+    return total_loss / N, pos_sum / N, rot_sum / N
 
 
 def evaluate_and_return_loss(
@@ -132,11 +146,10 @@ def evaluate_and_return_loss(
             y_pred     = model(X)
             mse        = (y_pred - y).pow(2).mean(dim=1)
             q_pred_raw = _denorm_q(y_pred, Y_min, Y_max)
-
-            T_pred   = FK_batch_full(q_pred_raw)
-            pos_loss = torch.norm(T_pred[:, :3, 3] - P_target, dim=1)
-            R_pred_6 = T_pred[:, :2, :3].reshape(len(X), 6)
-            rot_loss = torch.norm(R_pred_6 - R6_target, dim=1)
+            T_pred     = FK_batch_full(q_pred_raw)
+            pos_loss   = torch.norm(T_pred[:, :3, 3] - P_target, dim=1)
+            R_pred_6   = T_pred[:, :2, :3].reshape(len(X), 6)
+            rot_loss   = torch.norm(R_pred_6 - R6_target, dim=1)
 
             all_mse.append(mse)
             all_pos.append(pos_loss)
@@ -168,10 +181,12 @@ def run_training(
     epochs: int = 200,
     lr: float = 1e-3,
     patience: int = 30,
+    alpha_pos: float = 1.0,
+    alpha_rot: float = 0.1,
 ) -> nn.Module:
     """
     Full training loop with ReduceLROnPlateau scheduler and early stopping.
-    Primary loss: MSE on normalised q.
+    Loss = MSE(q_norm) + alpha_pos * pos_err + alpha_rot * rot_err.
     Returns model with the best weights loaded.
     """
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -183,12 +198,16 @@ def run_training(
     no_improvement = 0
 
     for epoch in range(1, epochs + 1):
-        train_mse, train_pos, train_rot = train(model, train_loader, optimizer, device, MinMax_Y)
-        val_mse,   val_pos,   val_rot   = evaluate(model, val_loader, device, MinMax_Y)
-        scheduler.step(val_mse)
+        train_loss, train_pos, train_rot = train(
+            model, train_loader, optimizer, device, MinMax_Y, alpha_pos, alpha_rot
+        )
+        val_loss, val_pos, val_rot = evaluate(
+            model, val_loader, device, MinMax_Y, alpha_pos, alpha_rot
+        )
+        scheduler.step(val_loss)
 
-        if val_mse < best_val:
-            best_val       = val_mse
+        if val_loss < best_val:
+            best_val       = val_loss
             torch.save(model.state_dict(), save_path)
             no_improvement = 0
         else:
@@ -196,8 +215,8 @@ def run_training(
 
         print(
             f"epoch {epoch:3d} | "
-            f"train mse {train_mse:.4f} (pos {train_pos:.4f} rot {train_rot:.4f}) | "
-            f"val mse {val_mse:.4f} (pos {val_pos:.4f} rot {val_rot:.4f}) | "
+            f"train {train_loss:.4f} (pos {train_pos:.4f} rot {train_rot:.4f}) | "
+            f"val {val_loss:.4f} (pos {val_pos:.4f} rot {val_rot:.4f}) | "
             f"lr {optimizer.param_groups[0]['lr']:.2e}"
         )
 
@@ -205,7 +224,7 @@ def run_training(
             print(f"Early stopping at epoch {epoch}.")
             break
 
-    print(f"\nbest val mse: {best_val:.4f}")
+    print(f"\nbest val loss: {best_val:.4f}")
     print(f"model saved to {save_path}")
     model.load_state_dict(torch.load(save_path, map_location=device))
     return model

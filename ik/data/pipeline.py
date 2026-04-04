@@ -10,12 +10,20 @@ Workflow:
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from ik.kinematics.fk import JOINT_LIMITS
+from ik.kinematics.fk import FK, JOINT_LIMITS
+from tqdm.auto import tqdm
 
 # ---------------------------------------------------------------------------
 # Dataset generation
 # ---------------------------------------------------------------------------
+def sample_q_init(n_samples: int, random_state: int = 42) -> np.ndarray:
+    """Uniformly samples n_samples q_init configurations within joint limits."""
+    np.random.seed(random_state)
+    low_lim, high_lim = JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1]
+    q_init = np.random.uniform(low_lim, high_lim, size=(n_samples, 6))
+    return q_init
 
+    
 def generate_euclidean_q_targets(q_init):
     """
     Generates 72 pairs per q_init across 4 joint-space Euclidean distance tiers.
@@ -49,7 +57,6 @@ def generate_euclidean_q_targets(q_init):
     # Random directions — uniform on unit sphere in 6D
     directions = np.random.randn(n, total_samples, 6)
     directions /= np.linalg.norm(directions, axis=2, keepdims=True)
-
     # Random magnitudes per tier, concatenated in order
     mags_list = []
     for deg_min, deg_max, n_samples in tiers_cfg:
@@ -72,7 +79,27 @@ def generate_euclidean_q_targets(q_init):
 
     return q_init_all, q_dest_all
 
+def generate_dataset(n_samples: int, random_state: int = 42):
+    """
+    Generates a full dataset ready for save_raw().
 
+    Returns:
+        q_init_all:  (m, 6)
+        q_dest_all:  (m, 6)
+        P_target:    (m, 3)  — EE position of q_dest
+        R6_target:   (m, 2, 3) — first 2 rows of EE rotation of q_dest
+    """
+    q_init = sample_q_init(n_samples, random_state)
+    q_init_all, q_dest_all = generate_euclidean_q_targets(q_init)
+    print('Generated q_init/q_dest pairs. Computing FK for all q_dest to get targets...')
+    FKs=[]
+    for q in tqdm(q_dest_all):
+        FKs.append(FK(q))
+    T_targets  = np.array(FKs)  # (m, 4, 4)
+    P_target   = T_targets[:, :3, 3].astype(np.float32)  # (m, 3)
+    R6_target  = T_targets[:, :2, :3].astype(np.float32) # (m, 2, 3)
+
+    return q_init_all, q_dest_all, P_target, R6_target
 # ---------------------------------------------------------------------------
 # Save / split / load
 # ---------------------------------------------------------------------------
@@ -124,3 +151,6 @@ def load_split(save_dir: str, split: str) -> tuple:
     P_target  = np.load(f"{save_dir}/P_target_{split}.npy").astype(np.float32)
     R6_target = np.load(f"{save_dir}/R6_target_{split}.npy").astype(np.float32)
     return q_init, q_target, P_target, R6_target
+
+
+
