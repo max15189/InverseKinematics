@@ -10,8 +10,7 @@ Workflow:
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from ik.kinematics.fk import FK, JOINT_LIMITS
-from ik.solver.iterative_ik import nr_ik
+from ik.kinematics.fk import JOINT_LIMITS
 
 # ---------------------------------------------------------------------------
 # Dataset generation
@@ -19,122 +18,59 @@ from ik.solver.iterative_ik import nr_ik
 
 def generate_euclidean_q_targets(q_init):
     """
-    Generates 30 targets per q_init based on Euclidean distance tiers in joint space.
-    Optimized for ML training sets with mixed transformation scales.
+    Generates 72 pairs per q_init across 4 joint-space Euclidean distance tiers.
+    Far tiers are oversampled to ensure representation despite joint limit clipping.
+    Each (q_init, q_dest) pair is also included reversed as (q_dest, q_init) —
+    L2 distance is symmetric so tier membership is preserved and the dataset doubles.
 
     Args:
         q_init: np.array of shape (n, 6) in radians
     Returns:
-        q_init_expanded: (30*n, 6)
-        q_dest: (30*n, 6)
+        q_init_all: (72*n, 6)
+        q_dest_all: (72*n, 6)
     """
     n = q_init.shape[0]
-    samples_per_tier = 10
-    total_samples = 30
 
     low_lim, high_lim = JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1]
 
-    # Define Euclidean Distance Tiers (Degrees -> Radians)
-    tiers_deg = np.array([
-        [1, 3],    # Close
-        [5, 15],   # Further
-        [15, 30]   # Far
-    ])
-    tiers_rad = np.deg2rad(tiers_deg)
+    # (deg_min, deg_max, n_samples)
+    # Far tiers get more samples to compensate for joint-limit clipping
+    tiers_cfg = [
+        (1,   3,   6),   # close
+        (5,  15,   8),   # medium
+        (15, 60,  10),   # far     (extended from original 30)
+        (60, 120, 12),   # very far
+    ]
+    total_samples = sum(n for _, _, n in tiers_cfg)  # 36
 
-    # Expand q_init to (n, 30, 6)
+    # Expand q_init to (n, total_samples, 6)
     q_expanded = np.repeat(q_init[:, np.newaxis, :], total_samples, axis=1)
 
-    # Random directions (uniform on unit sphere in 6D)
+    # Random directions — uniform on unit sphere in 6D
     directions = np.random.randn(n, total_samples, 6)
     directions /= np.linalg.norm(directions, axis=2, keepdims=True)
 
-    # Random magnitudes per tier
+    # Random magnitudes per tier, concatenated in order
     mags_list = []
-    for low, high in tiers_rad:
-        mags_list.append(np.random.uniform(low, high, size=(n, samples_per_tier)))
+    for deg_min, deg_max, n_samples in tiers_cfg:
+        low  = np.deg2rad(deg_min)
+        high = np.deg2rad(deg_max)
+        mags_list.append(np.random.uniform(low, high, size=(n, n_samples)))
 
-    magnitudes = np.concatenate(mags_list, axis=1)[:, :, np.newaxis]
+    magnitudes = np.concatenate(mags_list, axis=1)[:, :, np.newaxis]  # (n, 36, 1)
 
     q_dest = q_expanded + (directions * magnitudes)
     q_dest = np.clip(q_dest, low_lim, high_lim)
 
-    return q_expanded.reshape(-1, 6), q_dest.reshape(-1, 6)
+    q_init_flat = q_expanded.reshape(-1, 6)
+    q_dest_flat = q_dest.reshape(-1, 6)
 
-from tqdm import tqdm
+    # Symmetric augmentation: also treat each q_dest as a starting config.
+    # L2 distance is symmetric so tier membership is preserved.
+    q_init_all = np.concatenate([q_init_flat, q_dest_flat], axis=0)
+    q_dest_all = np.concatenate([q_dest_flat, q_init_flat], axis=0)
 
-def generate_task_space_targets(q_init, n_per_q: int = 36, seed: int | None = None):
-    """
-    Generates targets by sampling in task space around each q_init pose.
-
-    For each q_init:
-      1. Compute T_init = FK(q_init)
-      2. Perturb position by a random vector (sampled within a sphere)
-         and orientation by a random axis-angle rotation.
-      3. Run NR IK from q_init to find q_target for the perturbed pose.
-      4. Keep only converged pairs.
-
-    Tiers are defined in (pos metres, rot degrees) — directly meaningful
-    for task-space difficulty, unlike joint-space L2 norms.
-    Far tiers are oversampled to compensate for higher NR failure rates.
-
-    Args:
-        q_init:   (n, 6) initial joint configurations in radians
-        n_per_q:  total target samples per q_init across all tiers (default 36)
-        seed:     optional random seed
-
-    Returns:
-        q_inits:   (m, 6) — only converged pairs
-        q_targets: (m, 6)
-    """
-    if seed is not None:
-        np.random.seed(seed)
-
-    # (pos_min_m, pos_max_m, rot_min_deg, rot_max_deg, n_samples)
-    # Far tiers get more attempts to compensate for NR failures
-    tiers = [
-        (0.001, 0.02,  1,   5,  6),    # close    — easy, fewest attempts
-        (0.02,  0.10,  5,  20,  8),    # medium
-        (0.10,  0.30, 20,  60, 10),    # far
-        (0.30,  0.50, 60, 120, 12),    # very far — hardest, most attempts
-    ]
-
-    all_q_init, all_q_target = [], []
-
-    for q0 in tqdm(q_init, desc="generating"):
-        T0 = FK(q0)
-        p0 = T0[:3, 3]
-        R0 = T0[:3, :3]
-
-        for p_min, p_max, r_min_deg, r_max_deg, n in tiers:
-            r_min = np.deg2rad(r_min_deg)
-            r_max = np.deg2rad(r_max_deg)
-
-            for _ in range(n):
-                # --- position perturbation: uniform inside spherical shell ---
-                d   = np.random.randn(3)
-                d  /= np.linalg.norm(d)
-                r   = np.random.uniform(p_min, p_max)
-                p_t = p0 + r * d
-
-                # --- orientation perturbation: random axis-angle ---
-                w     = np.random.randn(3)
-                w    /= np.linalg.norm(w)
-                theta = np.random.uniform(r_min, r_max)
-                W     = np.array([[0, -w[2], w[1]], [w[2], 0, -w[0]], [-w[1], w[0], 0]])
-                R_per = np.eye(3) + np.sin(theta) * W + (1 - np.cos(theta)) * W @ W
-                R_t   = R_per @ R0
-
-                T_target        = np.eye(4)
-                T_target[:3, :3] = R_t
-                T_target[:3,  3] = p_t
-
-                q_sol, converged, _ = nr_ik(T_target, q0)
-                if converged:
-                    all_q_init.append(q0)
-                    all_q_target.append(q_sol)
-
-    return np.array(all_q_init, dtype=np.float32), np.array(all_q_target, dtype=np.float32)
+    return q_init_all, q_dest_all
 
 
 # ---------------------------------------------------------------------------
