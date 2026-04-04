@@ -1,68 +1,49 @@
 """
-Iterative inverse-kinematics solver.
+Newton-Raphson IK solver using the Modern Robotics library.
 
-Uses the trained MLP to iteratively refine a joint configuration
-until the end-effector reaches the target position within a threshold.
+Uses the space-frame Product-of-Exponentials formulation consistent
+with the ViperX-300 FK defined in ik.kinematics.fk.
 """
 
 import numpy as np
-import torch
-import torch.nn as nn
+import modern_robotics as mr
 
-from ik.kinematics.fk import FK_batch
+from ik.kinematics.fk import _Slist_np as Slist, _M_HOME_np as M_home
 
 
-def iterative_ik(
-    model: nn.Module,
-    q: torch.Tensor,
-    xd: torch.Tensor,
-    scaler_X: list,
-    scaler_Y: list,
-    device,
-    threshold: float = 2e-3,
-    max_iter: int = 20,
-    alpha: float = 0.5,
-) -> tuple[torch.Tensor, list[float], bool]:
+def nr_ik(
+    T_target: np.ndarray,
+    q_init: np.ndarray,
+    eomg: float = 0.01,
+    ev: float = 1e-3,
+    max_iter: int = 50,
+) -> tuple[np.ndarray, bool, int]:
     """
-    Iteratively apply the MLP to drive the end-effector towards xd.
+    Damping-free Newton-Raphson IK via the Modern Robotics space Jacobian.
 
     Args:
-        model:     trained MLP (in eval mode)
-        q:         (6,) initial joint configuration in radians
-        xd:        (3,) target end-effector position in metres
-        scaler_X:  [X_mean, X_std] tensors used during training
-        scaler_Y:  [Y_mean, Y_std] tensors used during training
-        device:    torch device
-        threshold: convergence criterion in metres (default 2 mm)
-        max_iter:  maximum number of iterations
-        alpha:     step size / damping factor in (0, 1]
+        T_target:  (4, 4) desired end-effector transform
+        q_init:    (6,)   initial joint configuration in radians
+        eomg:      orientation error tolerance (rad)
+        ev:        position error tolerance (m)
+        max_iter:  maximum NR iterations
 
     Returns:
-        q:             (6,) final joint configuration
-        error_history: list of end-effector errors per iteration (metres)
-        converged:     True if threshold was reached
+        q:          (6,) solution joint configuration
+        converged:  True if both eomg and ev tolerances were met
+        iterations: number of iterations taken
     """
-    X_mean, X_std = scaler_X[0].to(device), scaler_X[1].to(device)
-    Y_mean, Y_std = scaler_Y[0].to(device), scaler_Y[1].to(device)
+    thetalist = np.array(q_init, dtype=float).copy()
+    i   = 0
+    Tsb = mr.FKinSpace(M_home, Slist, thetalist)
+    Vs  = mr.Adjoint(Tsb) @ mr.se3ToVec(mr.MatrixLog6(mr.TransInv(Tsb) @ T_target))
+    err = np.linalg.norm(Vs[:3]) > eomg or np.linalg.norm(Vs[3:]) > ev
 
-    q  = q.to(device)
-    xd = xd.to(device)
-    error_history: list[float] = []
+    while err and i < max_iter:
+        thetalist += np.linalg.pinv(mr.JacobianSpace(Slist, thetalist)) @ Vs
+        i   += 1
+        Tsb  = mr.FKinSpace(M_home, Slist, thetalist)
+        Vs   = mr.Adjoint(Tsb) @ mr.se3ToVec(mr.MatrixLog6(mr.TransInv(Tsb) @ T_target))
+        err  = np.linalg.norm(Vs[:3]) > eomg or np.linalg.norm(Vs[3:]) > ev
 
-    model.eval()
-    for _ in range(max_iter):
-        inp        = torch.cat([q, xd]).unsqueeze(0)          # (1, 9)
-        inp_scaled = (inp - X_mean) / X_std
-
-        with torch.no_grad():
-            dq = model(inp_scaled) * Y_std + Y_mean           # (1, 6)
-
-        q = q + alpha * dq.squeeze(0)
-
-        error = torch.norm(xd - FK_batch(q.unsqueeze(0)).squeeze(0)).item()
-        error_history.append(error)
-
-        if error < threshold:
-            return q, error_history, True
-
-    return q, error_history, False
+    return thetalist, not err, i
