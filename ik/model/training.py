@@ -1,16 +1,13 @@
 """
 Training and evaluation routines for the IK MLP.
 
-Loss (combined):
-  MSE(q_pred_norm, q_true_norm)          — joint-space branch consistency
-  + alpha_pos * ||FK(q_pred)[:3,3] - P_target||   — task-space position
-  + alpha_rot * ||R_pred_6 - R6_target||           — task-space rotation
-All three terms are backpropagated. alpha_pos / alpha_rot default to 1.0 / 0.1.
-Setting both to 0 reverts to pure joint-space MSE.
+Loss:
+  alpha_pos * ||FK(q_pred)[:3,3] - P_target||   — task-space position
+  alpha_rot * ||R_pred_6 - R6_target||           — task-space rotation
 """
 
 import torch
-import torch.nn as nn
+import torch.nn as nn  # kept for type hints
 from torch.utils.data import DataLoader
 
 from ik.kinematics.fk import FK_batch_full
@@ -63,22 +60,17 @@ def train(
     """
     model.train()
     Y_min, Y_max = _to_tensors(MinMax_Y, device)
-    criterion = nn.MSELoss()
     total_loss, pos_sum, rot_sum = 0.0, 0.0, 0.0
 
     for X, y, _, _, P_target, R6_target in loader:
-        X, y      = X.to(device), y.to(device)
+        X         = X.to(device)
         P_target  = P_target.to(device)
         R6_target = R6_target.to(device)
 
         optimizer.zero_grad()
-        y_pred     = model(X)
-        mse_loss   = criterion(y_pred, y)
-
-        q_pred_raw          = _denorm_q(y_pred, Y_min, Y_max)
-        pos_loss, rot_loss  = _task_space_losses(q_pred_raw, P_target, R6_target)
-
-        loss = mse_loss + alpha_pos * pos_loss + alpha_rot * rot_loss
+        q_pred_raw         = _denorm_q(model(X), Y_min, Y_max)
+        pos_loss, rot_loss = _task_space_losses(q_pred_raw, P_target, R6_target)
+        loss = alpha_pos * pos_loss + alpha_rot * rot_loss
         loss.backward()
         optimizer.step()
 
@@ -102,20 +94,17 @@ def evaluate(
     """Evaluate on a loader without gradients. Returns (total_loss, pos_loss, rot_loss)."""
     model.eval()
     Y_min, Y_max = _to_tensors(MinMax_Y, device)
-    criterion = nn.MSELoss()
     total_loss, pos_sum, rot_sum = 0.0, 0.0, 0.0
 
     with torch.no_grad():
         for X, y, _, _, P_target, R6_target in loader:
-            X, y      = X.to(device), y.to(device)
+            X         = X.to(device)
             P_target  = P_target.to(device)
             R6_target = R6_target.to(device)
 
-            y_pred              = model(X)
-            mse_loss            = criterion(y_pred, y)
-            q_pred_raw          = _denorm_q(y_pred, Y_min, Y_max)
-            pos_loss, rot_loss  = _task_space_losses(q_pred_raw, P_target, R6_target)
-            loss                = mse_loss + alpha_pos * pos_loss + alpha_rot * rot_loss
+            q_pred_raw         = _denorm_q(model(X), Y_min, Y_max)
+            pos_loss, rot_loss = _task_space_losses(q_pred_raw, P_target, R6_target)
+            loss               = alpha_pos * pos_loss + alpha_rot * rot_loss
 
             n = len(X)
             total_loss += loss.item() * n
@@ -131,40 +120,35 @@ def evaluate_and_return_loss(
     loader: DataLoader,
     device,
     MinMax_Y: list,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return per-sample (mse_losses, pos_losses, rot_losses) as 1-D tensors. Prints means."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-sample (pos_losses, rot_losses) as 1-D tensors. Prints means."""
     model.eval()
     Y_min, Y_max = _to_tensors(MinMax_Y, device)
-    all_mse, all_pos, all_rot = [], [], []
+    all_pos, all_rot = [], []
 
     with torch.no_grad():
         for X, y, _, _, P_target, R6_target in loader:
-            X, y      = X.to(device), y.to(device)
+            X         = X.to(device)
             P_target  = P_target.to(device)
             R6_target = R6_target.to(device)
 
-            y_pred     = model(X)
-            mse        = (y_pred - y).pow(2).mean(dim=1)
-            q_pred_raw = _denorm_q(y_pred, Y_min, Y_max)
+            q_pred_raw = _denorm_q(model(X), Y_min, Y_max)
             T_pred     = FK_batch_full(q_pred_raw)
             pos_loss   = torch.norm(T_pred[:, :3, 3] - P_target, dim=1)
             R_pred_6   = T_pred[:, :2, :3].reshape(len(X), 6)
             rot_loss   = torch.norm(R_pred_6 - R6_target, dim=1)
 
-            all_mse.append(mse)
             all_pos.append(pos_loss)
             all_rot.append(rot_loss)
 
-    mse_losses = torch.cat(all_mse)
     pos_losses = torch.cat(all_pos)
     rot_losses = torch.cat(all_rot)
 
     print(
-        f"mean mse loss: {mse_losses.mean().item():.4f} | "
-        f"mean pos loss: {pos_losses.mean().item():.4f} | "
+        f"mean pos loss: {pos_losses.mean().item():.4f} m | "
         f"mean rot loss: {rot_losses.mean().item():.4f}"
     )
-    return mse_losses, pos_losses, rot_losses
+    return pos_losses, rot_losses
 
 
 # ---------------------------------------------------------------------------
