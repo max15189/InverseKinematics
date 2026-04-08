@@ -167,12 +167,20 @@ def run_training(
     patience: int = 30,
     alpha_pos: float = 1.0,
     alpha_rot: float = 0.1,
+    MinMax_X: list = None,  # required — kept as kwarg for call-site clarity
 ) -> nn.Module:
     """
     Full training loop with ReduceLROnPlateau scheduler and early stopping.
     Loss = MSE(q_norm) + alpha_pos * pos_err + alpha_rot * rot_err.
     Returns model with the best weights loaded.
+
+    Saves MinMax_X.npy and MinMax_Y.npy next to save_path so inference
+    scripts can load normalisation stats without touching the dataset.
     """
+    if MinMax_X is None:
+        raise ValueError("MinMax_X is required — pass train_ds.MinMax_X")
+    import os, numpy as np
+
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5
@@ -210,6 +218,12 @@ def run_training(
 
     print(f"\nbest val loss: {best_val:.4f}")
     print(f"model saved to {save_path}")
+
+    model_dir = os.path.dirname(save_path)
+    np.save(os.path.join(model_dir, "MinMax_X.npy"), np.array(MinMax_X, dtype=object))
+    np.save(os.path.join(model_dir, "MinMax_Y.npy"), np.array(MinMax_Y, dtype=object))
+    print(f"MinMax saved to {model_dir}")
+
     model.load_state_dict(torch.load(save_path, map_location=device))
     return model
 

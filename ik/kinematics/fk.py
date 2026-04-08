@@ -3,42 +3,20 @@ Forward Kinematics for ViperX-300 6-DOF arm.
 Provides both a NumPy implementation (FK) and a batched PyTorch
 implementation (FK_batch) that supports autograd for task-space losses.
 
-Robot spec: https://docs.trossenrobotics.com/interbotix_xsarms_docs/specifications/vx300s.html
+Robot parameters (joint limits, M_HOME, SLIST) live in ik.viperx300.
 """
 
 import numpy as np
 import torch
 
+from ik.viperx300 import JOINT_LIMITS, M_HOME, SLIST
+
 # ---------------------------------------------------------------------------
-# Robot constants
+# Internal aliases (used throughout this file)
 # ---------------------------------------------------------------------------
 
-JOINT_LIMITS = np.deg2rad([
-    [-180,  180],   # waist
-    [-101,  101],   # shoulder
-    [-101,   92],   # elbow
-    [-180,  180],   # forearm roll
-    [-107,  130],   # wrist angle
-    [-180,  180],   # wrist rotate
-])  # shape (6, 2)
-
-# Screw axes — each ROW is [w; v] for one joint; transposed so each COLUMN
-# is the screw axis for joint i (space-frame POE convention).
-_Slist_np = np.array([
-    [0,  0,  1,  0,        0,       0      ],  # joint 1 (waist)
-    [0,  1,  0, -0.12705,  0,       0      ],  # joint 2 (shoulder)
-    [0,  1,  0, -0.42705,  0,       0.05955],  # joint 3 (elbow)
-    [1,  0,  0,  0,        0.42705, 0      ],  # joint 4 (forearm roll)
-    [0,  1,  0, -0.42705,  0,       0.35955],  # joint 5 (wrist angle)
-    [1,  0,  0,  0,        0.42705, 0      ],  # joint 6 (wrist rotate)
-]).T  # shape (6, 6)
-
-_M_HOME_np = np.array([
-    [1, 0, 0, 0.536494],
-    [0, 1, 0, 0       ],
-    [0, 0, 1, 0.42705 ],
-    [0, 0, 0, 1       ],
-], dtype=float)
+_Slist_np  = SLIST
+_M_HOME_np = M_HOME
 
 # PyTorch versions (created once; moved to device inside FK_batch)
 _Slist_torch  = torch.tensor(_Slist_np,  dtype=torch.float32)

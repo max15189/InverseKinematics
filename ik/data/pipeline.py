@@ -10,7 +10,8 @@ Workflow:
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from ik.kinematics.fk import FK, JOINT_LIMITS
+from ik.kinematics.fk import FK
+from ik.viperx300 import JOINT_LIMITS
 from tqdm.auto import tqdm
 
 # ---------------------------------------------------------------------------

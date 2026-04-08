@@ -1,0 +1,16 @@
+{
+    "SAVE_DATA":  "dataset",
+    "SAVE_MODEL": "model/model.pt",
+
+    "BATCH_SIZE": 512,
+    "EPOCHS":     200,
+    "LR":         1e-3,
+    "PATIENCE":   30,
+    "ALPHA_POS":  1.0,
+    "ALPHA_ROT":  0.1,
+
+    "NR_EOMG":    1e-3,
+    "NR_EV":      1e-3,
+    "NR_MAXITER": 50,
+    "N_TESTS":    500
+}
